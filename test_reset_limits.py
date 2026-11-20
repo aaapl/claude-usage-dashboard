@@ -41,6 +41,22 @@ def test_get_usage_at_wall_appends_query(monkeypatch):
     assert captured['url'] == auf.USAGE_URL + '?at_wall=1&skip_spend=1'
 
 
+def test_get_usage_sends_cli_surface_user_agent(monkeypatch):
+    # Live finding (2026-11-20): the server derives the client "surface" from
+    # the UA. `claude-code/<ver>` → cedar_ember ineligible_reason "surface";
+    # `claude-cli/<ver> (external, cli)` → grants returned (Team included).
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured['ua'] = req.get_header('User-agent')
+        return FakeResponse({})
+
+    monkeypatch.setattr(auf, '_urlopen', fake_urlopen)
+    auf._http_get_usage('TOK', at_wall=True)
+    assert captured['ua'] == f'claude-cli/{auf.CLI_VERSION} (external, cli)'
+    assert auf.CLI_SURFACE_UA == captured['ua']
+
+
 def test_get_usage_default_url_unchanged(monkeypatch):
     captured = {}
 
@@ -108,7 +124,7 @@ def test_claim_posts_program_with_oauth_headers(monkeypatch):
     assert captured['body'] == {'program': 'juniper_tide'}
     assert captured['auth'] == 'Bearer TOK'
     assert captured['beta'] == 'oauth-2025-04-20'
-    assert captured['ua'].startswith('claude-code/')
+    assert captured['ua'] == auf.CLI_SURFACE_UA
 
 
 def test_claim_maps_http_error_status(monkeypatch):
@@ -124,6 +140,98 @@ def test_claim_maps_http_error_status(monkeypatch):
 def test_claim_requires_org_uuid():
     with pytest.raises(auf.UsageApiError):
         auf.claim_rate_limit_reset('TOK', '')
+
+
+# ---- cedar_ember (reset grants: "Full reset", per-model "Fable" resets) ----
+
+FULL_GRANT = {
+    'id': 'full-reset-2611', 'label': 'Full reset', 'type': 'full',
+    'resets_total': 1, 'resets_left': 1,
+    'starts_at': None, 'ends_at': '2026-12-10T00:00:00Z',
+    'clears': ['five_hour', 'seven_day', 'seven_day_overage_included'],
+    'paused': False, 'usable_now': True, 'use_requires_limit': False,
+    'gives_back_weekly': False,
+}
+FABLE_GRANT = {
+    'id': 'launch-2610-fable', 'label': 'Fable reset', 'type': 'model',
+    'resets_total': 1, 'resets_left': 1,
+    'ends_at': '2027-03-09T00:00:00Z',
+    'clears': ['five_hour', 'seven_day_overage_included'],
+    'paused': False, 'usable_now': True, 'gives_back_weekly': True,
+}
+CEDAR_ELIGIBLE = {
+    'eligible': True, 'ineligible_reason': None, 'at_limit': False,
+    'grants': [FULL_GRANT, FABLE_GRANT], 'next_grant_id': 'full-reset-2611',
+}
+
+
+def test_map_cedar_status_lists_grants():
+    st = auf.map_cedar_status({'cedar_ember': CEDAR_ELIGIBLE})
+    assert st['eligible'] is True
+    assert st['next_grant_id'] == 'full-reset-2611'
+    assert [g['id'] for g in st['grants']] == ['full-reset-2611', 'launch-2610-fable']
+    full = st['grants'][0]
+    assert full == {
+        'id': 'full-reset-2611', 'label': 'Full reset', 'type': 'full',
+        'resets_left': 1, 'resets_total': 1, 'usable_now': True, 'paused': False,
+        'ends_at': '2026-12-10T00:00:00Z',
+        'clears': ['five_hour', 'seven_day', 'seven_day_overage_included'],
+        'gives_back_weekly': False,
+    }
+
+
+def test_map_cedar_status_ineligible_surface():
+    st = auf.map_cedar_status({'cedar_ember': {
+        'eligible': False, 'ineligible_reason': 'surface', 'grants': []}})
+    assert st['eligible'] is False
+    assert st['ineligible_reason'] == 'surface'
+    assert st['grants'] == []
+
+
+def test_map_cedar_status_skips_malformed_grant():
+    # Same rule as the CLI: a grant without a valid id is dropped, not fatal.
+    st = auf.map_cedar_status({'cedar_ember': dict(
+        CEDAR_ELIGIBLE, grants=[{'label': 'no id'}, FULL_GRANT])})
+    assert [g['id'] for g in st['grants']] == ['full-reset-2611']
+
+
+def test_map_cedar_status_absent_or_malformed_returns_none():
+    assert auf.map_cedar_status({}) is None
+    assert auf.map_cedar_status({'cedar_ember': None}) is None
+    assert auf.map_cedar_status({'cedar_ember': 'x'}) is None
+
+
+def test_claim_cedar_posts_grant_and_request_id(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured['url'] = req.full_url
+        captured['body'] = json.loads(req.data.decode())
+        captured['ua'] = req.get_header('User-agent')
+        return FakeResponse({'result': 'reset', 'resets_left': 0,
+                             'cleared': ['five_hour']})
+
+    monkeypatch.setattr(auf, '_urlopen', fake_urlopen)
+    out = auf.claim_cedar_reset('TOK', 'org-1', 'full-reset-2611', 'req_abc-1')
+    assert out['result'] == 'reset'
+    assert captured['url'] == \
+        'https://api.anthropic.com/api/organizations/org-1/reset_rate_limits'
+    assert captured['body'] == {'program': 'cedar_ember',
+                                'grant_id': 'full-reset-2611',
+                                'request_id': 'req_abc-1'}
+    assert captured['ua'] == auf.CLI_SURFACE_UA
+
+
+@pytest.mark.parametrize('grant_id,request_id', [
+    ('Full-Reset', 'r1'),          # uppercase not allowed in grant ids (CLI regex)
+    ('a' * 41, 'r1'),              # too long
+    ('ok-grant', 'bad id!'),       # request id charset
+    ('', 'r1'),
+])
+def test_claim_cedar_rejects_malformed_ids(monkeypatch, grant_id, request_id):
+    monkeypatch.setattr(auf, '_urlopen', lambda *a, **k: pytest.fail('must not POST'))
+    with pytest.raises(auf.UsageApiError):
+        auf.claim_cedar_reset('TOK', 'org-1', grant_id, request_id)
 
 
 # ---- Layer 2: accounts.organization_uuid persistence ----
@@ -239,7 +347,80 @@ def test_get_reset_status_reads_at_wall(db, monkeypatch):
     monkeypatch.setattr(resetter.auf, '_http_get_usage', usage)
     st = resetter.get_reset_status(db, account)
     assert captured['at_wall'] is True
-    assert st['available'] is True
+    assert st['juniper']['available'] is True
+    assert st['cedar'] is None
+
+
+def test_get_reset_status_includes_cedar_grants(db, monkeypatch):
+    a = _add(db, org_uuid='org-1')
+    account = db.get_account_for_primer(a)
+    api = _usage()
+    api['cedar_ember'] = CEDAR_ELIGIBLE
+    monkeypatch.setattr(resetter.auf, '_http_get_usage',
+                        lambda token, at_wall=False: api)
+    st = resetter.get_reset_status(db, account)
+    assert st['juniper'] is None
+    assert [g['id'] for g in st['cedar']['grants']] == \
+        ['full-reset-2611', 'launch-2610-fable']
+
+
+def _cedar_usage(grants=None):
+    api = _usage()
+    api['cedar_ember'] = dict(CEDAR_ELIGIBLE,
+                              grants=grants if grants is not None
+                              else [FULL_GRANT, FABLE_GRANT])
+    return api
+
+
+def test_reset_grant_claims_cedar(db, monkeypatch):
+    import re
+    a = _add(db, org_uuid='org-1')
+    account = db.get_account_for_primer(a)
+    claimed = {}
+
+    monkeypatch.setattr(resetter.auf, '_http_get_usage',
+                        lambda token, at_wall=False: _cedar_usage())
+
+    def claim(token, org, grant_id, request_id):
+        claimed.update(org=org, grant=grant_id, req=request_id)
+        return {'result': 'reset', 'resets_left': 0, 'cleared': ['five_hour']}
+
+    monkeypatch.setattr(resetter.auf, 'claim_cedar_reset', claim)
+    monkeypatch.setattr(resetter.auf, 'claim_rate_limit_reset',
+                        lambda *a: pytest.fail('juniper must not be claimed'))
+    out = resetter.reset_account(db, account, grant_id='launch-2610-fable')
+    assert out['reset'] is True
+    assert out['result'] == 'reset'
+    assert out['cleared'] == ['five_hour']
+    assert claimed['org'] == 'org-1'
+    assert claimed['grant'] == 'launch-2610-fable'
+    assert re.fullmatch(r'[A-Za-z0-9_-]{1,64}', claimed['req'])
+    assert db.get_current(account_id=a) is not None      # post-claim snapshot
+
+
+def test_reset_grant_not_usable_is_never_claimed(db, monkeypatch):
+    a = _add(db, org_uuid='org-1')
+    account = db.get_account_for_primer(a)
+    spent = dict(FULL_GRANT, resets_left=0, usable_now=False)
+    monkeypatch.setattr(resetter.auf, '_http_get_usage',
+                        lambda token, at_wall=False: _cedar_usage([spent]))
+    monkeypatch.setattr(resetter.auf, 'claim_cedar_reset',
+                        lambda *a: pytest.fail('must not claim a spent grant'))
+    out = resetter.reset_account(db, account, grant_id='full-reset-2611')
+    assert out['reset'] is False
+    assert out['result'] == 'unavailable'
+
+
+def test_reset_unknown_grant_is_never_claimed(db, monkeypatch):
+    a = _add(db, org_uuid='org-1')
+    account = db.get_account_for_primer(a)
+    monkeypatch.setattr(resetter.auf, '_http_get_usage',
+                        lambda token, at_wall=False: _cedar_usage())
+    monkeypatch.setattr(resetter.auf, 'claim_cedar_reset',
+                        lambda *a: pytest.fail('must not claim an unlisted grant'))
+    out = resetter.reset_account(db, account, grant_id='made-up-grant')
+    assert out['reset'] is False
+    assert out['result'] == 'unavailable'
 
 
 def test_reset_claims_when_available(db, monkeypatch):
@@ -378,7 +559,7 @@ def client(tmp_path, monkeypatch):
 def test_reset_limit_route_success(client, monkeypatch):
     a = _add(app_module._db, org_uuid='org-1')
     monkeypatch.setattr(resetter, 'reset_account',
-                        lambda db, account: {'reset': True, 'result': 'reset',
+                        lambda db, account, grant_id=None: {'reset': True, 'result': 'reset',
                                              'next_available_at': '2026-11-27T10:00:00Z'})
     r = client.post(f'/accounts/{a}/reset_limit')
     assert r.status_code == 200
@@ -390,7 +571,7 @@ def test_reset_limit_route_success(client, monkeypatch):
 def test_reset_limit_route_unavailable(client, monkeypatch):
     a = _add(app_module._db, org_uuid='org-1')
     monkeypatch.setattr(resetter, 'reset_account',
-                        lambda db, account: {'reset': False, 'result': 'unavailable',
+                        lambda db, account, grant_id=None: {'reset': False, 'result': 'unavailable',
                                              'next_available_at': '2026-11-22T10:00:00Z'})
     r = client.post(f'/accounts/{a}/reset_limit')
     assert r.status_code == 200
@@ -407,7 +588,7 @@ def test_reset_limit_route_unknown_account_404(client):
 def test_reset_limit_route_api_error_maps_502(client, monkeypatch):
     a = _add(app_module._db, org_uuid='org-1')
 
-    def boom(db, account):
+    def boom(db, account, grant_id=None):
         raise auf.UsageApiError('claim failed', status=429)
 
     monkeypatch.setattr(resetter, 'reset_account', boom)
@@ -419,7 +600,7 @@ def test_reset_limit_route_api_error_maps_502(client, monkeypatch):
 def test_reset_limit_route_unexpected_error_hides_message(client, monkeypatch):
     a = _add(app_module._db, org_uuid='org-1')
 
-    def boom(db, account):
+    def boom(db, account, grant_id=None):
         raise RuntimeError('secret-token-xyz must not leak')
 
     monkeypatch.setattr(resetter, 'reset_account', boom)
@@ -433,10 +614,30 @@ def test_reset_limit_route_unexpected_error_hides_message(client, monkeypatch):
 def test_reset_status_route(client, monkeypatch):
     a = _add(app_module._db, org_uuid='org-1')
     monkeypatch.setattr(resetter, 'get_reset_status',
-                        lambda db, account: dict(AVAILABLE, ineligible_reason=None))
+                        lambda db, account: {
+                            'juniper': dict(AVAILABLE, ineligible_reason=None),
+                            'cedar': auf.map_cedar_status({'cedar_ember': CEDAR_ELIGIBLE})})
     r = client.get(f'/accounts/{a}/reset_status')
     assert r.status_code == 200
-    assert r.get_json()['status']['available'] is True
+    st = r.get_json()['status']
+    assert st['juniper']['available'] is True
+    assert st['cedar']['grants'][0]['id'] == 'full-reset-2611'
+
+
+def test_reset_limit_route_passes_grant_id(client, monkeypatch):
+    a = _add(app_module._db, org_uuid='org-1')
+    seen = {}
+
+    def fake_reset(db, account, grant_id=None):
+        seen['grant'] = grant_id
+        return {'reset': True, 'result': 'reset', 'next_available_at': None,
+                'cleared': ['five_hour']}
+
+    monkeypatch.setattr(resetter, 'reset_account', fake_reset)
+    r = client.post(f'/accounts/{a}/reset_limit', data={'grant_id': 'launch-2610-fable'})
+    assert r.status_code == 200
+    assert seen['grant'] == 'launch-2610-fable'
+    assert r.get_json()['cleared'] == ['five_hour']
 
 
 def test_reset_status_route_none_when_unsupported(client, monkeypatch):
@@ -489,3 +690,13 @@ def test_reset_limit_js_handler_checks_status_first():
     assert 'async function resetLimit(' in html
     assert '/reset_status' in html
     assert '/reset_limit' in html
+
+
+def test_reset_limit_ui_offers_cedar_grants():
+    """Reset grants (cedar_ember) must be offered by name and claimed with their
+    grant_id; labels are rendered via textContent (never innerHTML-interpolated)."""
+    html = _read('templates/accounts.html')
+    assert 'function chooseDialog(' in html
+    assert 'grant_id' in html
+    assert 'st.cedar' in html
+    assert '${o.label}' not in html          # option labels never interpolated into HTML

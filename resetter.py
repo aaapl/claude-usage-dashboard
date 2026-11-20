@@ -1,24 +1,34 @@
-"""Manual rate-limit reset ("restart"): claim Anthropic's juniper_tide program.
+"""Manual rate-limit reset ("restart"): claim one of Anthropic's reset programs.
 
 Mirrors primer.py — trigger-agnostic orchestration used by the web button. The
 flow matches what the Claude Code CLI does: read usage with at_wall=1 (the
-response then carries the juniper_tide status block), and when a reset is
-available POST /api/organizations/<uuid>/reset_rate_limits. Claiming consumes
-one of the account's limited resets, so the status gate runs server-side here
-too — a stale button click never wastes one.
+response then carries the reset status blocks), then POST
+/api/organizations/<uuid>/reset_rate_limits. Two programs exist:
+
+- cedar_ember: per-account reset grants ("Full reset", per-model resets such
+  as Fable). The claim names one grant_id. This is what Team accounts get.
+- juniper_tide: the free subscription reset (no grant id).
+
+Claiming consumes a limited reset, so availability is re-checked server-side
+here right before the POST — a stale button click never wastes one.
 """
+import uuid
+
 import account_session
 import api_usage_fetcher as auf
 import oauth_flow
 
 
-def get_reset_status(db, account):
-    """Mapped juniper_tide status for one account, or None when the API doesn't
-    expose the block (feature off / unknown shape). Raises auf.UsageApiError on
-    an API failure."""
-    api = account_session.call_with_401_retry(
+def _read_at_wall(db, account):
+    return account_session.call_with_401_retry(
         db, account, lambda tok: auf._http_get_usage(tok, at_wall=True))
-    return auf.map_reset_status(api)
+
+
+def get_reset_status(db, account):
+    """{'juniper': mapped juniper_tide|None, 'cedar': mapped cedar_ember|None}.
+    Raises auf.UsageApiError on an API failure."""
+    api = _read_at_wall(db, account)
+    return {'juniper': auf.map_reset_status(api), 'cedar': auf.map_cedar_status(api)}
 
 
 def _ensure_org_uuid(db, account):
@@ -39,42 +49,78 @@ def _ensure_org_uuid(db, account):
     return org_uuid
 
 
-def reset_account(db, account):
-    """Claim a rate-limit reset for one account if one is available.
+def _snapshot_after_reset(db, account):
+    """Best-effort post-claim snapshot so the dashboard shows the freed window
+    right away; a read failure must never turn a successful claim into an error."""
+    try:
+        api2 = account_session.call_with_401_retry(db, account, auf._http_get_usage)
+        db.insert_snapshot(auf.build_snapshot(api2, account))
+        db.record_account_poll(account['id'], error=None)
+    except auf.UsageApiError:
+        pass
 
-    Returns {'reset': bool, 'result': str, 'next_available_at': str|None}.
-    result: 'reset' (success), 'unavailable'/'ineligible' (client-side status
-    gate), or whatever the claim endpoint answered ('already_used',
-    'not_limited', 'ineligible', ...).
-    Raises auf.UsageApiError on an API failure (route maps it to HTTP 502).
-    """
-    api = account_session.call_with_401_retry(
-        db, account, lambda tok: auf._http_get_usage(tok, at_wall=True))
+
+def _str_or_none(v):
+    return v if isinstance(v, str) else None
+
+
+def _claim_cedar(db, account, api, grant_id):
+    status = auf.map_cedar_status(api)
+    grant = next((g for g in (status or {}).get('grants', []) if g['id'] == grant_id), None)
+    if not status or not status['eligible'] or grant is None \
+            or not grant['usable_now'] or grant['paused'] or grant['resets_left'] < 1:
+        return {'reset': False, 'result': 'unavailable', 'next_available_at': None,
+                'cleared': []}
+    org_uuid = _ensure_org_uuid(db, account)
+    # One request id per click; the 401-retry re-sends the SAME id so the server
+    # can dedupe a claim whose first attempt actually landed.
+    request_id = uuid.uuid4().hex
+    out = account_session.call_with_401_retry(
+        db, account,
+        lambda tok: auf.claim_cedar_reset(tok, org_uuid, grant_id, request_id))
+    result = out.get('result') if isinstance(out.get('result'), str) else 'unknown'
+    cleared = out.get('cleared')
+    if result == 'reset':
+        _snapshot_after_reset(db, account)
+    # cedar_ember has no "next reset" time (its weekly_resets_at is the weekly
+    # window's reset, not a grant's) — report None rather than mislabel it.
+    return {'reset': result == 'reset', 'result': result,
+            'next_available_at': None,
+            'cleared': [c for c in cleared if isinstance(c, str)]
+            if isinstance(cleared, list) else []}
+
+
+def _claim_juniper(db, account, api):
     status = auf.map_reset_status(api)
-    # status None = unknown (Team accounts answer juniper_tide=null on the OAuth
-    # surface, live finding 2026-11-20). Unknown does NOT block: the server is
-    # the real gate and an ineligible claim consumes nothing. Only a KNOWN
-    # unavailable/ineligible status short-circuits client-side.
+    # status None = unknown (Team accounts answer juniper_tide=null). Unknown does
+    # NOT block: the server is the real gate and an ineligible claim consumes
+    # nothing. Only a KNOWN unavailable/ineligible status short-circuits here.
     if status is not None and not status['available']:
         result = 'unavailable' if status['eligible'] else 'ineligible'
         return {'reset': False, 'result': result,
-                'next_available_at': status['next_available_at']}
-
+                'next_available_at': status['next_available_at'], 'cleared': []}
     org_uuid = _ensure_org_uuid(db, account)
     out = account_session.call_with_401_retry(
         db, account, lambda tok: auf.claim_rate_limit_reset(tok, org_uuid))
     result = out.get('result') if isinstance(out.get('result'), str) else 'unknown'
-    next_at = out.get('next_available_at')
-
-    # Best-effort post-claim snapshot so the dashboard shows the freed window
-    # right away; a read failure must never turn a successful claim into an error.
     if result == 'reset':
-        try:
-            api2 = account_session.call_with_401_retry(
-                db, account, auf._http_get_usage)
-            db.insert_snapshot(auf.build_snapshot(api2, account))
-            db.record_account_poll(account['id'], error=None)
-        except auf.UsageApiError:
-            pass
+        _snapshot_after_reset(db, account)
     return {'reset': result == 'reset', 'result': result,
-            'next_available_at': next_at if isinstance(next_at, str) else None}
+            'next_available_at': _str_or_none(out.get('next_available_at')),
+            'cleared': []}
+
+
+def reset_account(db, account, grant_id=None):
+    """Claim a rate-limit reset for one account.
+
+    grant_id given → claim that cedar_ember grant (only if the fresh status lists
+    it as usable); otherwise → juniper_tide. Returns {'reset': bool, 'result':
+    str, 'next_available_at': str|None, 'cleared': [window names]}. result is
+    'reset' on success, 'unavailable'/'ineligible' from the local gate, or the
+    claim endpoint's answer ('already_used', 'not_limited', 'cooldown', ...).
+    Raises auf.UsageApiError on an API failure (route maps it to HTTP 502).
+    """
+    api = _read_at_wall(db, account)
+    if grant_id:
+        return _claim_cedar(db, account, api, grant_id)
+    return _claim_juniper(db, account, api)

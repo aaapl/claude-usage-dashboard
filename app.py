@@ -565,15 +565,17 @@ def accounts_op(account_id, op):
         account = db.get_account_for_primer(account_id)
         if account is None:
             return jsonify({'error': 'No such account.'}), 404
+        grant_id = request.form.get('grant_id', '').strip() or None
         try:
-            result = resetter.reset_account(db, account)
+            result = resetter.reset_account(db, account, grant_id=grant_id)
         except auf.UsageApiError as e:
             return jsonify({'error': f'Could not reset the limit: {e}'}), 502
         except Exception as e:  # noqa: BLE001 — surface a clean 500, never a token
             return jsonify({'error': f'Unexpected error: {type(e).__name__}'}), 500
         return jsonify({'ok': True, 'reset': result['reset'],
                         'result': result['result'],
-                        'next_available_at': result['next_available_at']})
+                        'next_available_at': result['next_available_at'],
+                        'cleared': result.get('cleared', [])})
     else:
         return jsonify({'error': 'unknown op'}), 400
     return jsonify({'ok': True})
