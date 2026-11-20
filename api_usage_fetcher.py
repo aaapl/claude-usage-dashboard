@@ -20,6 +20,13 @@ from typing import Any, Dict, List, Optional
 USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
 MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
+# Rate-limit reset ("restart"): the official claim endpoint the Claude Code CLI
+# calls (observed in the 2.1.329 bundle). `juniper_tide` is Anthropic's program
+# name for the free subscription limit resets; status for it rides along in the
+# usage response only when the GET carries at_wall=1.
+RESET_URL_TEMPLATE = 'https://api.anthropic.com/api/organizations/{org_uuid}/reset_rate_limits'
+RESET_PROGRAM = 'juniper_tide'
+AT_WALL_QUERY = '?at_wall=1&skip_spend=1'
 # Cheapest model; starting the 5h (session) window works with ANY model and Haiku
 # does not touch the 7d Sonnet/Opus windows. Overridable for forward-compat.
 PRIMER_MODEL = os.environ.get('PRIMER_MODEL', 'claude-haiku-4-5')
@@ -280,8 +287,9 @@ def build_snapshot(api: Dict[str, Any], account: Dict[str, Any],
     }
 
 
-def _http_get_usage(access_token: str) -> Dict[str, Any]:
-    req = urllib.request.Request(USAGE_URL, headers={
+def _http_get_usage(access_token: str, at_wall: bool = False) -> Dict[str, Any]:
+    url = USAGE_URL + AT_WALL_QUERY if at_wall else USAGE_URL
+    req = urllib.request.Request(url, headers={
         'Authorization': f'Bearer {access_token}',
         'anthropic-beta': 'oauth-2025-04-20',
         'User-Agent': f'claude-code/{CLI_VERSION}',
@@ -297,6 +305,56 @@ def _http_get_usage(access_token: str) -> Dict[str, Any]:
             status=e.code) from e
     except Exception as e:
         raise UsageApiError(f'usage request failed: {type(e).__name__}: {e}') from e
+
+
+def map_reset_status(api: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize the `juniper_tide` block of an at_wall usage response.
+
+    Returns {eligible, available, next_available_at, ineligible_reason} or None
+    when the block is absent or malformed — the reset feature is experimental
+    server-side, so an unreadable block must degrade to "unknown", never raise.
+    """
+    block = api.get('juniper_tide')
+    if not isinstance(block, dict):
+        return None
+    next_at = block.get('next_available_at')
+    reason = block.get('ineligible_reason')
+    return {
+        'eligible': bool(block.get('eligible')),
+        'available': bool(block.get('available')),
+        'next_available_at': next_at if isinstance(next_at, str) else None,
+        'ineligible_reason': reason if isinstance(reason, str) else None,
+    }
+
+
+def claim_rate_limit_reset(access_token: str, org_uuid: str) -> Dict[str, Any]:
+    """POST the juniper_tide reset claim; return the parsed response body.
+
+    Same OAuth surface as _http_get_usage. Raises UsageApiError(status=...) on
+    an HTTP error (401 → caller refreshes and retries; 429 → claim throttled).
+    An empty org_uuid is a caller bug surfaced as UsageApiError so the route can
+    report it instead of POSTing to a malformed URL.
+    """
+    if not org_uuid:
+        raise UsageApiError('cannot claim a reset without an organization uuid')
+    body = json.dumps({'program': RESET_PROGRAM}).encode()
+    url = RESET_URL_TEMPLATE.format(org_uuid=org_uuid)
+    req = urllib.request.Request(url, data=body, method='POST', headers={
+        'Authorization': f'Bearer {access_token}',
+        'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': f'claude-code/{CLI_VERSION}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    })
+    try:
+        with _urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise UsageApiError(
+            f'reset claim failed: HTTPError: HTTP Error {e.code}: {e.reason}',
+            status=e.code) from e
+    except Exception as e:
+        raise UsageApiError(f'reset claim failed: {type(e).__name__}: {e}') from e
 
 
 def send_haiku_primer(access_token: str, model: Optional[str] = None) -> Dict[str, Any]:

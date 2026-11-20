@@ -47,6 +47,7 @@
             <span class="acc-actions">
                 {% if a.is_active %}
                 <button class="primer" onclick="startSession({{ a.id }})">Start 5h</button>
+                <button class="primer" onclick="resetLimit({{ a.id }})">Reset limit</button>
                 {% endif %}
                 <button class="reauth" data-email="{{ a.email }}" data-label="{{ a.label }}">Refresh session</button>
                 {% if a.is_active %}
@@ -346,6 +347,59 @@ async function startSession(id) {
         else showToast(reset
             ? `Window already active — resets at ${reset}.`
             : 'Window already active.', 'info');
+    } catch (e) {
+        showToast('Error: ' + e, 'err');
+    }
+}
+// Reset the account's rate limit (Anthropic's limited "restart"). Status is read
+// first so the confirm dialog shows real availability — and because resets are a
+// limited resource, an unavailable one is never claimed from a stale button.
+async function resetLimit(id) {
+    showToast('Checking reset availability…', 'load', {sticky: true});
+    let st;
+    try {
+        const r = await fetch(`/accounts/${id}/reset_status`);
+        const d = await r.json();
+        if (!r.ok) { showToast(d.error || `Error ${r.status}`, 'err'); return; }
+        st = d.status;
+    } catch (e) { showToast('Error: ' + e, 'err'); return; }
+    const fmtWhen = iso => iso
+        ? new Date(iso).toLocaleString([], {weekday: 'short', hour: '2-digit', minute: '2-digit'})
+        : null;
+    if (st && !st.available) {
+        const when = fmtWhen(st.next_available_at);
+        showToast(st.eligible
+            ? (when ? `No reset available right now — next one ${when}.`
+                    : 'No reset available right now.')
+            : 'This account is not eligible for limit resets.', 'info');
+        return;
+    }
+    // st === null: the API reports no reset status on this surface (seen on Team
+    // accounts). The claim may still work — the server decides and an ineligible
+    // claim consumes nothing, so offer the attempt with an honest caveat.
+    const ok = await confirmDialog({
+        title: 'Use a limit reset?',
+        body: st
+            ? 'Resets this account\'s current usage limit now. Resets are limited — one will be consumed.'
+            : 'This account does not report reset availability — the attempt may be refused. If a reset is available, one will be consumed.',
+        confirmLabel: st ? 'Use reset' : 'Try reset', cancelLabel: 'Cancel', danger: true
+    });
+    if (!ok) return;
+    showToast('Resetting limit…', 'load', {sticky: true});
+    try {
+        const r = await fetch(`/accounts/${id}/reset_limit`, {method: 'POST'});
+        const d = await r.json();
+        if (!r.ok) { showToast(d.error || `Error ${r.status}`, 'err'); return; }
+        const next = fmtWhen(d.next_available_at);
+        if (d.reset) showToast(next
+            ? `Limit reset — next reset available ${next}.`
+            : 'Limit reset.', 'ok');
+        else if (d.result === 'not_limited') showToast('Nothing to reset — this account is not at a limit.', 'info');
+        else if (d.result === 'already_used') showToast(next
+            ? `Reset already used — next one ${next}.`
+            : 'Reset already used.', 'info');
+        else if (d.result === 'ineligible') showToast('Reset refused — this account is not eligible (no reset was consumed).', 'info');
+        else showToast(`Reset not performed (${d.result}).`, 'info');
     } catch (e) {
         showToast('Error: ' + e, 'err');
     }
