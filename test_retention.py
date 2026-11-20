@@ -86,10 +86,14 @@ def test_prune_data_dir_removes_old_keeps_recent_and_nondates():
         new_raw = os.path.join(raw, "new.bin")
         open(old_raw, "w").close()
         open(new_raw, "w").close()
-        old_ts = time.time() - 200 * 86400  # ~200 days ago
-        os.utime(old_raw, (old_ts, old_ts))
-
         cutoff = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        # Anchor the mtimes to the cutoff, not to the wall clock: "200 days
+        # ago" stopped being before 2026-03-01 in mid-September 2026.
+        old_ts = cutoff.timestamp() - 86400
+        new_ts = cutoff.timestamp() + 86400
+        os.utime(old_raw, (old_ts, old_ts))
+        os.utime(new_raw, (new_ts, new_ts))
+
         res = cleanup_old_data.prune_data_dir(data_dir, cutoff)
 
         assert res == {"dirs": 2, "raw_files": 1}
