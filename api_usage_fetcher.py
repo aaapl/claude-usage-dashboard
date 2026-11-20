@@ -46,11 +46,21 @@ CLIENT_ID = os.environ.get('CLAUDE_OAUTH_CLIENT_ID',
                            '9d1c250a-e61b-44d9-88ed-5944d1962f5e')
 # Only used for the User-Agent header; keep loosely in sync with the CLI.
 CLI_VERSION = os.environ.get('CLAUDE_CLI_VERSION', '2.1.329')
-# UA for the usage + reset endpoints, in the exact format the CLI sends (bV() in
-# the 2.1.329 bundle). The server derives the client "surface" AND the CLI
-# version from it: `claude-code/<ver>` → cedar_ember ineligible "surface" (no
-# reset grants); a too-old version → "cli_version". Keep CLI_VERSION current.
-# Not used for the token endpoint — see TOKEN_ENDPOINT_UA.
+# The reset feature (status read with at_wall, and the claim) is the ONLY code
+# that uses the UA below. Everything that existed before it — the collector's
+# usage polling, the 5h primer, the profile read — keeps sending
+# `claude-code/{CLI_VERSION}` exactly as it always has.
+#
+# The reset endpoints need the format the CLI itself sends (bV() in the 2.1.329
+# bundle): the server derives the client "surface" AND the CLI version from it.
+# `claude-code/<ver>` → cedar_ember ineligible "surface" (no reset grants); a
+# too-old version → "cli_version". Keep CLI_VERSION current — it is the one
+# version number behind both user-agents.
+#
+# Keeping the two apart is also what protects the collector: the usage endpoint
+# is rate-limited per account AND per surface. Measured live (2026-11-20): with
+# one account's CLI surface 429'd after a burst of reset status reads, the same
+# read sent as `claude-code/<ver>` in the same second returned 200.
 CLI_SURFACE_UA = f'claude-cli/{CLI_VERSION} (external, cli)'
 # User-Agent for the token endpoint (platform.claude.com/v1/oauth/token). It is
 # fronted by Cloudflare with two traps: spoofing `claude-code/<ver>` trips
@@ -301,11 +311,13 @@ def build_snapshot(api: Dict[str, Any], account: Dict[str, Any],
 
 
 def _http_get_usage(access_token: str, at_wall: bool = False) -> Dict[str, Any]:
+    # Only the at_wall read (reset status) uses the CLI surface; the plain read
+    # is unchanged — see CLI_SURFACE_UA.
     url = USAGE_URL + AT_WALL_QUERY if at_wall else USAGE_URL
     req = urllib.request.Request(url, headers={
         'Authorization': f'Bearer {access_token}',
         'anthropic-beta': 'oauth-2025-04-20',
-        'User-Agent': CLI_SURFACE_UA,
+        'User-Agent': CLI_SURFACE_UA if at_wall else f'claude-code/{CLI_VERSION}',
         'Accept': 'application/json',
     })
     try:

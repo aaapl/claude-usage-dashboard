@@ -727,3 +727,25 @@ def test_reset_limit_ui_dismisses_checking_toast():
     html = _read('templates/accounts.html')
     assert "const checking = showToast('Checking reset availability…'" in html
     assert 'dismissToast(checking)' in html
+
+
+def test_existing_requests_keep_their_user_agent_format(monkeypatch):
+    # The pre-existing requests keep the `claude-code/<ver>` format; only the
+    # reset status read and the claim use the CLI surface. Both take their
+    # version from the one CLI_VERSION constant.
+    # Live finding (2026-11-20): the usage rate limit is per account and per
+    # User-Agent surface, so the collector's plain read sharing the CLI surface
+    # with the reset status read got an account's polling 429'd.
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured['ua'] = req.get_header('User-agent')
+        return FakeResponse({})
+
+    monkeypatch.setattr(auf, '_urlopen', fake_urlopen)
+    auf._http_get_usage('TOK')
+    assert captured['ua'] == f'claude-code/{auf.CLI_VERSION}'
+    auf._http_get_usage('TOK', at_wall=True)
+    assert captured['ua'] == auf.CLI_SURFACE_UA == f'claude-cli/{auf.CLI_VERSION} (external, cli)'
+    auf.send_haiku_primer('TOK')
+    assert captured['ua'] == f'claude-code/{auf.CLI_VERSION}'
