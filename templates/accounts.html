@@ -430,7 +430,7 @@ async function startSession(id) {
 // first so the confirm dialog shows real availability — and because resets are a
 // limited resource, an unavailable one is never claimed from a stale button.
 async function resetLimit(id) {
-    showToast('Checking reset availability…', 'load', {sticky: true});
+    const checking = showToast('Checking reset availability…', 'load', {sticky: true});
     let st;
     try {
         const r = await fetch(`/accounts/${id}/reset_status`);
@@ -438,6 +438,8 @@ async function resetLimit(id) {
         if (!r.ok) { showToast(d.error || `Error ${r.status}`, 'err'); return; }
         st = d.status;
     } catch (e) { showToast('Error: ' + e, 'err'); return; }
+    // Close the sticky spinner before any dialog: a Cancel/Esc there returns early.
+    dismissToast(checking);
     const fmtWhen = iso => iso
         ? new Date(iso).toLocaleString([], {weekday: 'short', hour: '2-digit', minute: '2-digit'})
         : null;

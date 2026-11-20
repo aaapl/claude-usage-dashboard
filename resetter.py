@@ -51,12 +51,14 @@ def _ensure_org_uuid(db, account):
 
 def _snapshot_after_reset(db, account):
     """Best-effort post-claim snapshot so the dashboard shows the freed window
-    right away; a read failure must never turn a successful claim into an error."""
+    right away. The reset is already consumed at this point, so NO failure here
+    (API read, or a DB write such as a locked SQLite) may turn the successful
+    claim into an error — the next collector poll records the window anyway."""
     try:
         api2 = account_session.call_with_401_retry(db, account, auf._http_get_usage)
         db.insert_snapshot(auf.build_snapshot(api2, account))
         db.record_account_poll(account['id'], error=None)
-    except auf.UsageApiError:
+    except Exception:  # noqa: BLE001
         pass
 
 

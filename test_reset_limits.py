@@ -700,3 +700,30 @@ def test_reset_limit_ui_offers_cedar_grants():
     assert 'grant_id' in html
     assert 'st.cedar' in html
     assert '${o.label}' not in html          # option labels never interpolated into HTML
+
+
+def test_reset_success_survives_snapshot_db_failure(db, monkeypatch):
+    """PR review: a consumed reset must never be reported as an error because the
+    best-effort snapshot write failed (e.g. SQLite locked)."""
+    import sqlite3
+    a = _add(db, org_uuid='org-1')
+    account = db.get_account_for_primer(a)
+    monkeypatch.setattr(resetter.auf, '_http_get_usage',
+                        lambda token, at_wall=False: _cedar_usage())
+    monkeypatch.setattr(resetter.auf, 'claim_cedar_reset',
+                        lambda tok, org, gid, rid: {'result': 'reset', 'cleared': []})
+
+    def locked(snapshot):
+        raise sqlite3.OperationalError('database is locked')
+
+    monkeypatch.setattr(db, 'insert_snapshot', locked)
+    out = resetter.reset_account(db, account, grant_id='full-reset-2611')
+    assert out['reset'] is True
+
+
+def test_reset_limit_ui_dismisses_checking_toast():
+    """PR review: the sticky 'Checking…' toast must be closed once the status
+    read finishes, so cancelling a dialog leaves no spinner behind."""
+    html = _read('templates/accounts.html')
+    assert "const checking = showToast('Checking reset availability…'" in html
+    assert 'dismissToast(checking)' in html
