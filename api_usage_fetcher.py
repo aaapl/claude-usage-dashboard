@@ -151,6 +151,29 @@ def _scoped_model_name(item: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def scoped_model_display_name(api: Dict[str, Any]) -> Optional[str]:
+    """Display name of the model behind the per-model weekly limit (e.g. "Fable").
+
+    Reset grants do not name the model they refill — they only list the windows
+    they clear — so the UI takes the name from the `weekly_scoped` entry of the
+    `limits` array. None when there is no such entry, or when several entries
+    name different models (ambiguous → the UI falls back to a generic name).
+    """
+    limits = api.get('limits')
+    if not isinstance(limits, list):
+        return None
+    names = set()
+    for item in limits:
+        if not isinstance(item, dict) or item.get('kind') != 'weekly_scoped':
+            continue
+        scope = item.get('scope')
+        model = scope.get('model') if isinstance(scope, dict) else None
+        name = model.get('display_name') if isinstance(model, dict) else None
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names.pop() if len(names) == 1 else None
+
+
 def _map_from_limits(limits: List[Any], now: datetime) -> List[Dict[str, Any]]:
     """Map the canonical `limits` array (2026-06-30+) to quota dicts.
 
@@ -370,6 +393,7 @@ def _grant_dict(item: Any) -> Optional[Dict[str, Any]]:
         return v if isinstance(v, str) else None
 
     clears = item.get('clears')
+    used = item.get('percent_used')
     return {
         'id': gid,
         'label': _str('label') or gid,
@@ -381,6 +405,11 @@ def _grant_dict(item: Any) -> Optional[Dict[str, Any]]:
         'ends_at': _str('ends_at'),
         'clears': [c for c in clears if isinstance(c, str)] if isinstance(clears, list) else [],
         'gives_back_weekly': bool(item.get('gives_back_weekly')),
+        # Current utilization of each window, so the confirm step can show what
+        # a reset would actually give back right now.
+        'percent_used': {k: v for k, v in used.items()
+                         if isinstance(k, str) and isinstance(v, (int, float))
+                         and not isinstance(v, bool)} if isinstance(used, dict) else {},
     }
 
 

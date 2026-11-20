@@ -569,7 +569,7 @@ def accounts_op(account_id, op):
         try:
             result = resetter.reset_account(db, account, grant_id=grant_id)
         except auf.UsageApiError as e:
-            return jsonify({'error': f'Could not reset the limit: {e}'}), 502
+            return jsonify(_reset_api_error('Could not reset the limit', e)), 502
         except Exception as e:  # noqa: BLE001 — surface a clean 500, never a token
             return jsonify({'error': f'Unexpected error: {type(e).__name__}'}), 500
         return jsonify({'ok': True, 'reset': result['reset'],
@@ -579,6 +579,18 @@ def accounts_op(account_id, op):
     else:
         return jsonify({'error': 'unknown op'}), 400
     return jsonify({'ok': True})
+
+
+def _reset_api_error(prefix, e):
+    """JSON body for a failed reset call. A 429 gets its own wording and a
+    `rate_limited` flag: the reset status read is rate-limited per account, and
+    retrying right away may keep it blocked for longer, so the page stops
+    sending. (The API's Retry-After is no help — it comes back as 0.)"""
+    if getattr(e, 'status', None) == 429:
+        return {'error': 'Anthropic is rate-limiting usage requests for this account. '
+                         'Wait a few minutes before trying again.',
+                'rate_limited': True}
+    return {'error': f'{prefix}: {e}'}
 
 
 @app.route('/accounts/<int:account_id>/reset_status')
@@ -593,7 +605,7 @@ def account_reset_status(account_id):
     try:
         status = resetter.get_reset_status(db, account)
     except auf.UsageApiError as e:
-        return jsonify({'error': f'Could not read reset status: {e}'}), 502
+        return jsonify(_reset_api_error('Could not read reset status', e)), 502
     except Exception as e:  # noqa: BLE001 — surface a clean 500, never a token
         return jsonify({'error': f'Unexpected error: {type(e).__name__}'}), 500
     return jsonify({'status': status})

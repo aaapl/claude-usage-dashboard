@@ -176,7 +176,7 @@ def test_map_cedar_status_lists_grants():
         'resets_left': 1, 'resets_total': 1, 'usable_now': True, 'paused': False,
         'ends_at': '2026-12-10T00:00:00Z',
         'clears': ['five_hour', 'seven_day', 'seven_day_overage_included'],
-        'gives_back_weekly': False,
+        'gives_back_weekly': False, 'percent_used': {},
     }
 
 
@@ -461,22 +461,30 @@ def test_reset_blocked_when_unavailable(db, monkeypatch):
     assert claims['n'] == 0                 # never claims when not available
 
 
-def test_reset_claims_when_status_unknown(db, monkeypatch):
-    # Live finding (2026-11-20): Team accounts answer juniper_tide=null on the
-    # OAuth surface even at the wall. Unknown status must NOT block the claim —
-    # the server is the real gate (an ineligible claim returns a result and
-    # consumes nothing). Only a KNOWN-unavailable status blocks client-side.
+def test_reset_never_claims_when_status_absent(db, monkeypatch):
+    # Team accounts answer juniper_tide=null (their resets are cedar_ember
+    # grants). With no status block there is no reset on offer, so nothing is
+    # POSTed — a blind claim would only be refused, from the collector's IP.
     a = _add(db, org_uuid='org-1')
     account = db.get_account_for_primer(a)
 
     monkeypatch.setattr(resetter.auf, '_http_get_usage',
                         lambda token, at_wall=False: _usage())
     monkeypatch.setattr(resetter.auf, 'claim_rate_limit_reset',
-                        lambda token, org: {'result': 'ineligible',
-                                            'next_available_at': None})
+                        lambda *a: pytest.fail('must not claim without a status'))
+    monkeypatch.setattr(resetter.oauth_flow, 'fetch_profile',
+                        lambda *a: pytest.fail('must not resolve the org either'))
     out = resetter.reset_account(db, account)
-    assert out['reset'] is False
-    assert out['result'] == 'ineligible'    # the server's verdict, passed through
+    assert out == {'reset': False, 'result': 'unavailable',
+                   'next_available_at': None, 'cleared': []}
+
+
+def test_reset_limit_ui_has_no_blind_claim():
+    """With neither grants nor a juniper_tide status the UI reports that no
+    reset is available instead of offering an attempt."""
+    html = _read('templates/accounts.html')
+    assert 'Try reset' not in html
+    assert 'No limit resets are available for this account' in html
 
 
 def test_reset_backfills_org_uuid_from_profile(db, monkeypatch):
@@ -679,7 +687,7 @@ def _read(rel):
 def test_reset_limit_button_present():
     html = _read('templates/accounts.html')
     assert 'resetLimit({{ a.id }})' in html
-    assert '>Reset limit<' in html
+    assert '>Limit resets<' in html
 
 
 def test_reset_limit_js_handler_checks_status_first():
@@ -725,8 +733,137 @@ def test_reset_limit_ui_dismisses_checking_toast():
     """PR review: the sticky 'Checking…' toast must be closed once the status
     read finishes, so cancelling a dialog leaves no spinner behind."""
     html = _read('templates/accounts.html')
-    assert "const checking = showToast('Checking reset availability…'" in html
+    assert "const checking = showToast('Checking reset availability…', 'load', {sticky: true});" in html
     assert 'dismissToast(checking)' in html
+
+
+def test_reset_limit_ui_groups_equivalent_grants():
+    """Grants that do the same thing (claude.ai's "Fable reset · 2") are one
+    choice that claims the first-expiring member; the picker also explains the
+    weekly give-back and shows the expiry time, not just the day.
+
+    Live finding (2026-11-20): the two Fable grants carry different labels
+    ("New model launch: one Fable reset for ..." / "... one more Fable reset at
+    6 months' tenure") and every grant has type "full", so the group key is
+    what a grant clears, never its label or type."""
+    html = _read('templates/accounts.html')
+    assert 'function groupResetGrants(' in html
+    assert 'groupResetGrants(usable)' in html
+    assert 'JSON.stringify([[...g.clears].sort(), g.gives_back_weekly])' in html
+    assert 'g.gives_back_weekly' in html
+    assert "gives back ${model || 'this model'}'s usage only" in html
+    assert "`${model || 'Model'} reset`" in html      # "Fable reset", as claude.ai names it
+    assert 'Refills your 5-hour and weekly limits.' in html
+    assert "hour: 'numeric'" in html.split('const fmtExpiry')[1].split('};')[0]
+
+
+# ---- model name for per-model resets ("Fable reset") ----
+
+def _scoped(name):
+    return {'kind': 'weekly_scoped', 'group': 'weekly', 'percent': 79,
+            'scope': {'model': {'id': None, 'display_name': name}, 'surface': None}}
+
+
+def test_scoped_model_display_name_from_limits():
+    # Live shape (2026-11-20): grants only list the windows they clear; the
+    # model name lives on the weekly_scoped entry of `limits`.
+    api = {'limits': [{'kind': 'session', 'scope': None},
+                      {'kind': 'weekly_all', 'scope': None}, _scoped('Fable')]}
+    assert auf.scoped_model_display_name(api) == 'Fable'
+
+
+@pytest.mark.parametrize('api', [
+    {}, {'limits': None}, {'limits': 'x'}, {'limits': [{'kind': 'weekly_all', 'scope': None}]},
+    {'limits': [{'kind': 'weekly_scoped', 'scope': None}]},
+    {'limits': [{'kind': 'weekly_scoped', 'scope': {'model': {'display_name': '  '}}}]},
+    {'limits': [_scoped('Fable'), _scoped('Opus')]},      # ambiguous → generic name
+])
+def test_scoped_model_display_name_none_when_absent_or_ambiguous(api):
+    assert auf.scoped_model_display_name(api) is None
+
+
+def test_get_reset_status_carries_scoped_model(db, monkeypatch):
+    a = _add(db, org_uuid='org-1')
+    account = db.get_account_for_primer(a)
+    api = _cedar_usage()
+    api['limits'] = [_scoped('Fable')]
+    monkeypatch.setattr(resetter.auf, '_http_get_usage',
+                        lambda token, at_wall=False: api)
+    assert resetter.get_reset_status(db, account)['scoped_model'] == 'Fable'
+
+
+# ---- confirm step after picking a grant ----
+
+def test_map_cedar_status_keeps_percent_used():
+    grant = dict(FULL_GRANT, percent_used={'five_hour': 52, 'seven_day': 83.4,
+                                           'junk': 'x', 'flag': True})
+    st = auf.map_cedar_status({'cedar_ember': dict(CEDAR_ELIGIBLE, grants=[grant])})
+    assert st['grants'][0]['percent_used'] == {'five_hour': 52, 'seven_day': 83.4}
+    bad = dict(FULL_GRANT, percent_used='nope')
+    st = auf.map_cedar_status({'cedar_ember': dict(CEDAR_ELIGIBLE, grants=[bad])})
+    assert st['grants'][0]['percent_used'] == {}
+
+
+def test_reset_limit_ui_confirms_after_picking_a_grant():
+    """Picking a row in the grant picker must not spend a reset by itself: a
+    confirm step (the "Start 5h" convention) sits between the pick and the POST."""
+    html = _read('templates/accounts.html')
+    handler = html.split('async function resetLimit(')[1].split('async function delAcc(')[0]
+    pick = handler.index('await chooseDialog(')
+    confirm = handler.index('title: `Use ${resetName(g)}?`')
+    post = handler.index('/reset_limit')
+    assert pick < confirm < post
+    assert 'Cannot be undone.' in handler
+
+
+# ---- per-account rate limit on the usage endpoint ----
+
+def test_reset_status_route_429_asks_to_wait(client, monkeypatch):
+    # Live finding (2026-11-20): about ten status reads in a quarter of an hour
+    # got one account 429'd, which also blocked the collector's polling for it.
+    a = _add(app_module._db, org_uuid='org-1')
+
+    def boom(db, account):
+        raise auf.UsageApiError('usage request failed: HTTPError: HTTP Error 429', status=429)
+
+    monkeypatch.setattr(resetter, 'get_reset_status', boom)
+    r = client.get(f'/accounts/{a}/reset_status')
+    assert r.status_code == 502
+    body = r.get_json()
+    assert 'rate-limiting' in body['error'] and 'Wait a few minutes' in body['error']
+    assert body['rate_limited'] is True
+
+
+def test_reset_limit_route_429_asks_to_wait(client, monkeypatch):
+    a = _add(app_module._db, org_uuid='org-1')
+
+    def boom(db, account, grant_id=None):
+        raise auf.UsageApiError('reset claim failed', status=429)
+
+    monkeypatch.setattr(resetter, 'reset_account', boom)
+    r = client.post(f'/accounts/{a}/reset_limit')
+    assert r.status_code == 502
+    assert 'Wait a few minutes' in r.get_json()['error']
+
+
+def test_reset_limit_ui_reuses_a_recent_status():
+    """Opening and cancelling the picker must not cost a usage request each
+    time: a recent status is reused, and dropped once a claim is attempted."""
+    html = _read('templates/accounts.html')
+    handler = html.split('async function resetLimit(')[1].split('async function delAcc(')[0]
+    assert '_resetStatusCache.get(id)' in handler
+    assert '_resetStatusCache.set(id' in handler
+    assert handler.index('_resetStatusCache.delete(id)') < handler.index('/reset_limit')
+
+
+def test_reset_limit_ui_stops_sending_after_a_429():
+    """After a rate-limited answer the page must not send again for that
+    account until the block has had time to lift."""
+    html = _read('templates/accounts.html')
+    handler = html.split('async function resetLimit(')[1].split('async function delAcc(')[0]
+    assert handler.index('_resetBlockedUntil.get(id)') < handler.index('/reset_status')
+    assert handler.count('noteResetRateLimit(id, d)') == 2
+    assert 'Nothing was sent.' in handler
 
 
 def test_existing_requests_keep_their_user_agent_format(monkeypatch):

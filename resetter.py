@@ -25,10 +25,12 @@ def _read_at_wall(db, account):
 
 
 def get_reset_status(db, account):
-    """{'juniper': mapped juniper_tide|None, 'cedar': mapped cedar_ember|None}.
+    """{'juniper': mapped juniper_tide|None, 'cedar': mapped cedar_ember|None,
+    'scoped_model': display name of the per-model weekly limit|None}.
     Raises auf.UsageApiError on an API failure."""
     api = _read_at_wall(db, account)
-    return {'juniper': auf.map_reset_status(api), 'cedar': auf.map_cedar_status(api)}
+    return {'juniper': auf.map_reset_status(api), 'cedar': auf.map_cedar_status(api),
+            'scoped_model': auf.scoped_model_display_name(api)}
 
 
 def _ensure_org_uuid(db, account):
@@ -94,10 +96,14 @@ def _claim_cedar(db, account, api, grant_id):
 
 def _claim_juniper(db, account, api):
     status = auf.map_reset_status(api)
-    # status None = unknown (Team accounts answer juniper_tide=null). Unknown does
-    # NOT block: the server is the real gate and an ineligible claim consumes
-    # nothing. Only a KNOWN unavailable/ineligible status short-circuits here.
-    if status is not None and not status['available']:
+    # status None = the server reported no juniper_tide block (Team accounts
+    # answer null; their resets are cedar_ember grants). Nothing is on offer, so
+    # nothing is claimed: a blind POST would only earn a refusal from the IP the
+    # collector polls from.
+    if status is None:
+        return {'reset': False, 'result': 'unavailable',
+                'next_available_at': None, 'cleared': []}
+    if not status['available']:
         result = 'unavailable' if status['eligible'] else 'ineligible'
         return {'reset': False, 'result': result,
                 'next_available_at': status['next_available_at'], 'cleared': []}
@@ -116,7 +122,8 @@ def reset_account(db, account, grant_id=None):
     """Claim a rate-limit reset for one account.
 
     grant_id given → claim that cedar_ember grant (only if the fresh status lists
-    it as usable); otherwise → juniper_tide. Returns {'reset': bool, 'result':
+    it as usable); otherwise → juniper_tide (only if the fresh status reports it
+    available). Returns {'reset': bool, 'result':
     str, 'next_available_at': str|None, 'cleared': [window names]}. result is
     'reset' on success, 'unavailable'/'ineligible' from the local gate, or the
     claim endpoint's answer ('already_used', 'not_limited', 'cooldown', ...).
